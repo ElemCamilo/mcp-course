@@ -6,6 +6,8 @@ A minimal MCP server that provides tools for analyzing file changes and suggesti
 
 import json
 import os
+import asyncio
+import shutil
 import subprocess
 from typing import Optional
 from pathlib import Path
@@ -47,6 +49,25 @@ TYPE_MAPPING = {
 }
 
 
+def run_git_command(args: list[str], cwd: str, timeout: int = 15) -> subprocess.CompletedProcess[str]:
+    """Run a git command with a timeout so MCP tool calls cannot hang indefinitely."""
+    git_executable = shutil.which("git") or r"C:\Program Files\Git\cmd\git.exe"
+    repo_path = str(Path(cwd).resolve()).replace("\\", "/")
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return subprocess.run(
+        [git_executable, "-c", f"safe.directory={repo_path}", "-C", repo_path, *args],
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        check=True,
+        cwd=Path(__file__).parent,
+        env=env,
+        timeout=timeout,
+    )
+
+
 @mcp.tool()
 async def analyze_file_changes(
     base_branch: str = "main",
@@ -63,16 +84,38 @@ async def analyze_file_changes(
         working_directory: Directory to run git commands in (default: current directory)
     """
     try:
+        roots_check = {
+            "skipped": True,
+            "reason": "working_directory argument provided",
+        }
+
         # Try to get working directory from roots first
         if working_directory is None:
             try:
                 context = mcp.get_context()
-                roots_result = await context.session.list_roots()
-                # Get the first root - Claude Code sets this to the CWD
-                root = roots_result.roots[0]
-                # FileUrl object has a .path property that gives us the path directly
-                working_directory = root.uri.path
-            except Exception:
+                roots_result = await asyncio.wait_for(
+                    context.session.list_roots(),
+                    timeout=2.0,
+                )
+                roots_check = {
+                    "found": True,
+                    "count": len(roots_result.roots),
+                    "roots": [str(root.uri) for root in roots_result.roots],
+                }
+                if roots_result.roots:
+                    # FileUrl object has a .path property that gives us the path directly
+                    working_directory = roots_result.roots[0].uri.path
+                    if (
+                        len(working_directory) > 2
+                        and working_directory[0] == "/"
+                        and working_directory[2] == ":"
+                    ):
+                        working_directory = working_directory[1:]
+            except Exception as e:
+                roots_check = {
+                    "found": False,
+                    "error": str(e),
+                }
                 # If we can't get roots, fall back to current directory
                 pass
         
@@ -85,50 +128,28 @@ async def analyze_file_changes(
             "actual_cwd": cwd,
             "server_process_cwd": os.getcwd(),
             "server_file_location": str(Path(__file__).parent),
-            "roots_check": None
+            "roots_check": roots_check
         }
         
-        # Add roots debug info
-        try:
-            context = mcp.get_context()
-            roots_result = await context.session.list_roots()
-            debug_info["roots_check"] = {
-                "found": True,
-                "count": len(roots_result.roots),
-                "roots": [str(root.uri) for root in roots_result.roots]
-            }
-        except Exception as e:
-            debug_info["roots_check"] = {
-                "found": False,
-                "error": str(e)
-            }
-        
         # Get list of changed files
-        files_result = subprocess.run(
-            ["git", "diff", "--name-status", f"{base_branch}...HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=cwd
+        files_result = run_git_command(
+            ["diff", "--name-status", f"{base_branch}...HEAD"],
+            cwd,
         )
         
         # Get diff statistics
-        stat_result = subprocess.run(
-            ["git", "diff", "--stat", f"{base_branch}...HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=cwd
+        stat_result = run_git_command(
+            ["diff", "--stat", f"{base_branch}...HEAD"],
+            cwd,
         )
         
         # Get the actual diff if requested
         diff_content = ""
         truncated = False
         if include_diff:
-            diff_result = subprocess.run(
-                ["git", "diff", f"{base_branch}...HEAD"],
-                capture_output=True,
-                text=True,
-                cwd=cwd
+            diff_result = run_git_command(
+                ["diff", f"{base_branch}...HEAD"],
+                cwd,
             )
             diff_lines = diff_result.stdout.split('\n')
             
@@ -142,11 +163,9 @@ async def analyze_file_changes(
                 diff_content = diff_result.stdout
         
         # Get commit messages for context
-        commits_result = subprocess.run(
-            ["git", "log", "--oneline", f"{base_branch}..HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=cwd
+        commits_result = run_git_command(
+            ["log", "--oneline", f"{base_branch}..HEAD"],
+            cwd,
         )
         
         analysis = {
@@ -164,6 +183,14 @@ async def analyze_file_changes(
         
     except subprocess.CalledProcessError as e:
         return json.dumps({"error": f"Git error: {e.stderr}"})
+    except subprocess.TimeoutExpired as e:
+        return json.dumps(
+            {
+                "error": "Git command timed out",
+                "command": " ".join(e.cmd) if isinstance(e.cmd, list) else str(e.cmd),
+                "timeout_seconds": e.timeout,
+            }
+        )
     except Exception as e:
         return json.dumps({"error": str(e)})
 

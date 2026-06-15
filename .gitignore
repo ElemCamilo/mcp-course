@@ -176,3 +176,6 @@ cython_debug/
 .DS_Store
 
 videos/
+
+# Local tool installs
+tools/cloudflared/
