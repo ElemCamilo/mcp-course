@@ -1,0 +1,12 @@
+name: Webhook Test
+
+on:
+  push:
+    branches:
+      - test-pr-agent-docs
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Webhook test worked"
