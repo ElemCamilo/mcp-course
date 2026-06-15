@@ -6,6 +6,8 @@ Extend your PR Agent with webhook handling and MCP Prompts for CI/CD workflows.
 
 import json
 import os
+import asyncio
+import shutil
 import subprocess
 from typing import Optional
 from pathlib import Path
@@ -50,49 +52,68 @@ TYPE_MAPPING = {
 }
 
 
+def run_git_command(args: list[str], cwd: str, timeout: int = 15) -> subprocess.CompletedProcess[str]:
+    """Run a git command with a timeout so MCP tool calls cannot hang indefinitely."""
+    git_executable = shutil.which("git") or r"C:\Program Files\Git\cmd\git.exe"
+    repo_path = str(Path(cwd).resolve()).replace("\\", "/")
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return subprocess.run(
+        [git_executable, "-c", f"safe.directory={repo_path}", "-C", repo_path, *args],
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        check=True,
+        cwd=Path(__file__).parent,
+        env=env,
+        timeout=timeout,
+    )
+
+
 # ===== Module 1 Tools (Already includes output limiting fix from Module 1) =====
 
 @mcp.tool()
 async def analyze_file_changes(
     base_branch: str = "main",
     include_diff: bool = True,
-    max_diff_lines: int = 500
+    max_diff_lines: int = 500,
+    working_directory: Optional[str] = None
 ) -> str:
     """Get the full diff and list of changed files in the current git repository.
-    
+
     Args:
         base_branch: Base branch to compare against (default: main)
         include_diff: Include the full diff content (default: true)
         max_diff_lines: Maximum number of diff lines to include (default: 500)
+        working_directory: Directory to run git commands in (default: current directory)
     """
     try:
-        # Get list of changed files
-        files_result = subprocess.run(
-            ["git", "diff", "--name-status", f"{base_branch}...HEAD"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        # Get diff statistics
-        stat_result = subprocess.run(
-            ["git", "diff", "--stat", f"{base_branch}...HEAD"],
-            capture_output=True,
-            text=True
-        )
-        
-        # Get the actual diff if requested
+        if working_directory is None:
+            try:
+                context = mcp.get_context()
+                roots_result = await asyncio.wait_for(
+                    context.session.list_roots(),
+                    timeout=2.0,
+                )
+                if roots_result.roots:
+                    working_directory = roots_result.roots[0].uri.path
+                    if len(working_directory) > 2 and working_directory[0] == "/" and working_directory[2] == ":":
+                        working_directory = working_directory[1:]
+            except Exception:
+                pass
+
+        cwd = working_directory if working_directory else os.getcwd()
+
+        files_result = run_git_command(["diff", "--name-status", f"{base_branch}...HEAD"], cwd)
+        stat_result = run_git_command(["diff", "--stat", f"{base_branch}...HEAD"], cwd)
+
         diff_content = ""
         truncated = False
+        diff_lines = []
         if include_diff:
-            diff_result = subprocess.run(
-                ["git", "diff", f"{base_branch}...HEAD"],
-                capture_output=True,
-                text=True
-            )
+            diff_result = run_git_command(["diff", f"{base_branch}...HEAD"], cwd)
             diff_lines = diff_result.stdout.split('\n')
-            
-            # Check if we need to truncate (learned from Module 1)
             if len(diff_lines) > max_diff_lines:
                 diff_content = '\n'.join(diff_lines[:max_diff_lines])
                 diff_content += f"\n\n... Output truncated. Showing {max_diff_lines} of {len(diff_lines)} lines ..."
@@ -100,14 +121,9 @@ async def analyze_file_changes(
                 truncated = True
             else:
                 diff_content = diff_result.stdout
-        
-        # Get commit messages for context
-        commits_result = subprocess.run(
-            ["git", "log", "--oneline", f"{base_branch}..HEAD"],
-            capture_output=True,
-            text=True
-        )
-        
+
+        commits_result = run_git_command(["log", "--oneline", f"{base_branch}..HEAD"], cwd)
+
         analysis = {
             "base_branch": base_branch,
             "files_changed": files_result.stdout,
@@ -117,11 +133,13 @@ async def analyze_file_changes(
             "truncated": truncated,
             "total_diff_lines": len(diff_lines) if include_diff else 0
         }
-        
+
         return json.dumps(analysis, indent=2)
-        
+
     except subprocess.CalledProcessError as e:
         return json.dumps({"error": f"Git error: {e.stderr}"})
+    except subprocess.TimeoutExpired as e:
+        return json.dumps({"error": "Git command timed out", "timeout_seconds": e.timeout})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
