@@ -10,6 +10,7 @@ import subprocess
 from typing import Optional
 from pathlib import Path
 
+import requests
 from mcp.server.fastmcp import FastMCP
 
 # Initialize the FastMCP server
@@ -251,15 +252,24 @@ async def send_slack_notification(message: str) -> str:
         return "Error: SLACK_WEBHOOK_URL environment variable not set"
     
     try:
-        # TODO: Import requests library
-        # TODO: Send POST request to webhook_url with JSON payload
-        # TODO: Include the message in the JSON data
-        # TODO: Handle the response and return appropriate status
-        
-        # For now, return a placeholder
-        return f"TODO: Implement Slack webhook POST request for message: {message[:50]}..."
-        
-    except Exception as e:
+        # Send POST request to Slack webhook with the message as JSON payload
+        response = requests.post(
+            webhook_url,
+            json={"text": message},
+            timeout=10
+        )
+
+        # Slack returns "ok" with a 200 status on success
+        if response.status_code == 200:
+            return "✅ Message sent successfully to Slack"
+        else:
+            return f"Error: Slack API returned status code {response.status_code}: {response.text}"
+
+    except requests.exceptions.Timeout:
+        return "Error: Request to Slack timed out"
+    except requests.exceptions.ConnectionError:
+        return "Error: Could not connect to Slack. Check your internet connection and webhook URL"
+    except requests.exceptions.RequestException as e:
         return f"Error sending message: {str(e)}"
 
 
@@ -267,61 +277,41 @@ async def send_slack_notification(message: str) -> str:
 
 @mcp.prompt()
 async def format_ci_failure_alert():
-    """Create a Slack alert for CI/CD failures with rich formatting."""
-    return """Format this GitHub Actions failure as a Slack message using ONLY Slack markdown syntax:
+    """Create a Slack alert for CI/CD failures."""
+    return """Format this GitHub Actions failure as a Slack message:
 
-❌ *CI Failed* - [Repository Name]
+Use this template:
+:rotating_light: *CI Failure Alert* :rotating_light:
 
-> Brief summary of what failed
+A CI workflow has failed:
+*Workflow*: workflow_name
+*Branch*: branch_name
+*Status*: Failed
+*View Details*: <LOGS_LINK|View Logs>
 
-*Details:*
-• Workflow: `workflow_name`
-• Branch: `branch_name`  
-• Commit: `commit_hash`
+Please check the logs and address any issues.
 
-*Next Steps:*
-• <https://github.com/test/repo/actions/runs/123|View Action Logs>
-
-CRITICAL: Use EXACT Slack link format: <https://full-url|Link Text>
-Examples:
-- CORRECT: <https://github.com/user/repo|Repository>
-- WRONG: [Repository](https://github.com/user/repo)
-- WRONG: https://github.com/user/repo
-
-Other Slack formats:
-- *text* for bold (NOT **text**)
-- `text` for code
-- > text for quotes
-- • for bullets"""
+Use Slack markdown formatting and keep it concise for quick team scanning."""
 
 
 @mcp.prompt()
 async def format_ci_success_summary():
     """Create a Slack message celebrating successful deployments."""
-    return """Format this successful GitHub Actions run as a Slack message using ONLY Slack markdown syntax:
+    return """Format this successful GitHub Actions run as a Slack message:
 
-✅ *Deployment Successful* - [Repository Name]
+Use this template:
+:white_check_mark: *Deployment Successful* :white_check_mark:
 
-> Brief summary of what was deployed
+Deployment completed successfully for [Repository Name]
 
 *Changes:*
-• Key feature or fix 1
-• Key feature or fix 2
+- Key feature or fix 1
+- Key feature or fix 2
 
 *Links:*
-• <https://github.com/user/repo|View Changes>
+<PR_LINK|View Changes>
 
-CRITICAL: Use EXACT Slack link format: <https://full-url|Link Text>
-Examples:
-- CORRECT: <https://github.com/user/repo|Repository>
-- WRONG: [Repository](https://github.com/user/repo)
-- WRONG: https://github.com/user/repo
-
-Other Slack formats:
-- *text* for bold (NOT **text**)
-- `text` for code
-- > text for quotes
-- • for bullets"""
+Keep it celebratory but informative. Use Slack markdown formatting."""
 
 
 # ===== Prompts from Module 2 (Complete) =====
